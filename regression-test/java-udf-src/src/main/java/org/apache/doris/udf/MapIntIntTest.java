@@ -15,22 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#pragma once
+package org.apache.doris.udf;
 
-#include "runtime/result_writer.h"
+import org.apache.hadoop.hive.ql.exec.UDF;
 
-namespace doris {
-namespace vectorized {
+import java.util.*;
 
-class Block;
+public class MapIntIntTest extends UDF {
+    public Integer evaluate(HashMap<Integer, Integer> hashMap) {
+        Integer mul = 0;
+        for (Map.Entry<Integer, Integer> entry : hashMap.entrySet()) {
+            Integer key = entry.getKey();
+            Integer value = entry.getValue();
+            mul += key * value;
+        }
+        return mul;
+    }
+}
 
-class VResultWriter : public ResultWriter {
-public:
-    VResultWriter() : ResultWriter() {}
-
-    virtual Status append_block(Block& block) = 0;
-
-    virtual bool can_sink() { return true; }
-};
-} // namespace vectorized
-} // namespace doris
