@@ -129,9 +129,16 @@ public class Replica implements Writable {
     private long furtherRepairSetTime = -1;
     private static final long FURTHER_REPAIR_TIMEOUT_MS = 20 * 60 * 1000L; // 20min
 
-    // if this watermarkTxnId is set, which means before deleting a replica,
-    // we should ensure that all txns on this replicas are finished.
-    private long watermarkTxnId = -1;
+
+    /* Decommission a backend B, steps are as follow:
+     * 1. wait peer backends catchup with B;
+     * 2. B change state to DECOMMISSION, set preWatermarkTxnId. B can load data now.
+     * 3. wait txn before preWatermarkTxnId finished, set postWatermarkTxnId. B can't load data now.
+     * 4. wait txn before postWatermarkTxnId finished, delete B.
+     *
+     */
+    private long preWatermarkTxnId = -1;
+    private long postWatermarkTxnId = -1;
 
     public Replica() {
     }
@@ -289,6 +296,34 @@ public class Replica implements Writable {
     public synchronized void updateVersionWithFailedInfo(
             long newVersion, long lastFailedVersion, long lastSuccessVersion) {
         updateReplicaInfo(newVersion, lastFailedVersion, lastSuccessVersion, dataSize, remoteDataSize, rowCount);
+    }
+
+    public synchronized void adminUpdateVersionInfo(Long version, Long lastFailedVersion, Long lastSuccessVersion,
+            long updateTime) {
+        if (version != null) {
+            this.version = version;
+        }
+        if (lastSuccessVersion != null) {
+            this.lastSuccessVersion = lastSuccessVersion;
+        }
+        if (lastFailedVersion != null) {
+            if (this.lastFailedVersion < lastFailedVersion) {
+                this.lastFailedTimestamp = updateTime;
+            }
+            this.lastFailedVersion = lastFailedVersion;
+        }
+        if (this.lastFailedVersion < this.version) {
+            this.lastFailedVersion = -1;
+            this.lastFailedTimestamp  = -1;
+            this.lastFailedVersionHash = 0;
+        }
+        if (this.lastFailedVersion > 0
+                && this.lastSuccessVersion > this.lastFailedVersion) {
+            this.lastSuccessVersion = this.version;
+        }
+        if (this.lastSuccessVersion < this.version) {
+            this.lastSuccessVersion = this.version;
+        }
     }
 
     /* last failed version:  LFV
@@ -480,6 +515,32 @@ public class Replica implements Writable {
         return strBuffer.toString();
     }
 
+    public String toStringSimple(boolean checkBeAlive) {
+        StringBuilder strBuffer = new StringBuilder("[replicaId=");
+        strBuffer.append(id);
+        strBuffer.append(", backendId=");
+        strBuffer.append(backendId);
+        if (checkBeAlive) {
+            strBuffer.append(", backendAlive=");
+            strBuffer.append(Env.getCurrentSystemInfo().checkBackendAlive(backendId));
+        }
+        strBuffer.append(", version=");
+        strBuffer.append(version);
+        if (lastFailedVersion > 0) {
+            strBuffer.append(", lastFailedVersion=");
+            strBuffer.append(lastFailedVersion);
+            strBuffer.append(", lastSuccessVersion=");
+            strBuffer.append(lastSuccessVersion);
+            strBuffer.append(", lastFailedTimestamp=");
+            strBuffer.append(lastFailedTimestamp);
+        }
+        strBuffer.append(", state=");
+        strBuffer.append(state.name());
+        strBuffer.append("]");
+
+        return strBuffer.toString();
+    }
+
     @Override
     public void write(DataOutput out) throws IOException {
         out.writeLong(id);
@@ -568,12 +629,20 @@ public class Replica implements Writable {
         }
     }
 
-    public void setWatermarkTxnId(long watermarkTxnId) {
-        this.watermarkTxnId = watermarkTxnId;
+    public void setPreWatermarkTxnId(long preWatermarkTxnId) {
+        this.preWatermarkTxnId = preWatermarkTxnId;
     }
 
-    public long getWatermarkTxnId() {
-        return watermarkTxnId;
+    public long getPreWatermarkTxnId() {
+        return preWatermarkTxnId;
+    }
+
+    public void setPostWatermarkTxnId(long postWatermarkTxnId) {
+        this.postWatermarkTxnId = postWatermarkTxnId;
+    }
+
+    public long getPostWatermarkTxnId() {
+        return postWatermarkTxnId;
     }
 
     public boolean isAlive() {

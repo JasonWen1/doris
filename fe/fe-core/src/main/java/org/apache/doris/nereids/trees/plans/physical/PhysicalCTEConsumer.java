@@ -76,7 +76,7 @@ public class PhysicalCTEConsumer extends PhysicalRelation {
     public PhysicalCTEConsumer(RelationId relationId, CTEId cteId, Map<Slot, Slot> consumerToProducerSlotMap,
             Map<Slot, Slot> producerToConsumerSlotMap, Optional<GroupExpression> groupExpression,
             LogicalProperties logicalProperties, PhysicalProperties physicalProperties, Statistics statistics) {
-        super(relationId, PlanType.PHYSICAL_CTE_CONSUME, groupExpression,
+        super(relationId, PlanType.PHYSICAL_CTE_CONSUMER, groupExpression,
                 logicalProperties, physicalProperties, statistics);
         this.cteId = cteId;
         this.consumerToProducerSlotMap = ImmutableMap.copyOf(Objects.requireNonNull(
@@ -142,12 +142,17 @@ public class PhysicalCTEConsumer extends PhysicalRelation {
 
     @Override
     public boolean pushDownRuntimeFilter(CascadesContext context, IdGenerator<RuntimeFilterId> generator,
-                                         AbstractPhysicalJoin builderNode,
-                                         Expression src, Expression probeExpr,
-                                         TRuntimeFilterType type, long buildSideNdv, int exprOrder) {
+            AbstractPhysicalJoin<?, ?> builderNode,
+            Expression src, Expression probeExpr,
+            TRuntimeFilterType type, long buildSideNdv, int exprOrder) {
         // push down rf on cte sender
         // TODO: refactor pushing down into cte internal here
         return super.pushDownRuntimeFilter(context, generator, builderNode,
                 src, probeExpr, type, buildSideNdv, exprOrder);
+    }
+
+    @Override
+    public boolean canPushDownRuntimeFilter() {
+        return true;
     }
 }

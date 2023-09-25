@@ -20,6 +20,7 @@ package org.apache.doris.planner.external;
 import org.apache.doris.analysis.Analyzer;
 import org.apache.doris.analysis.SlotDescriptor;
 import org.apache.doris.analysis.SlotId;
+import org.apache.doris.analysis.TableSample;
 import org.apache.doris.analysis.TupleDescriptor;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Env;
@@ -63,6 +64,7 @@ import org.apache.doris.thrift.TScanRange;
 import org.apache.doris.thrift.TScanRangeLocation;
 import org.apache.doris.thrift.TScanRangeLocations;
 import org.apache.doris.thrift.TTableFormatFileDesc;
+import org.apache.doris.thrift.TTextSerdeType;
 import org.apache.doris.thrift.TTransactionalHiveDeleteDeltaDesc;
 import org.apache.doris.thrift.TTransactionalHiveDesc;
 
@@ -73,7 +75,9 @@ import com.google.common.collect.Maps;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.net.URI;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -88,6 +92,8 @@ public abstract class FileQueryScanNode extends FileScanNode {
 
     protected Map<String, SlotDescriptor> destSlotDescByName;
     protected TFileScanRangeParams params;
+
+    protected TableSample tableSample;
 
     /**
      * External file scan node for Query hms table
@@ -137,7 +143,7 @@ public abstract class FileQueryScanNode extends FileScanNode {
                                 table.getName()));
             }
         }
-        computeColumnFilter();
+        computeColumnsFilter();
         initBackendPolicy();
         initSchemaParams();
     }
@@ -149,6 +155,9 @@ public abstract class FileQueryScanNode extends FileScanNode {
             destSlotDescByName.put(slot.getColumn().getName(), slot);
         }
         params = new TFileScanRangeParams();
+        if (this instanceof HiveScanNode) {
+            params.setTextSerdeType(TTextSerdeType.HIVE_TEXT_SERDE);
+        }
         params.setDestTupleId(desc.getId().asInt());
         List<String> partitionKeys = getPathPartitionKeys();
         List<Column> columns = desc.getTable().getBaseSchema(false);
@@ -192,6 +201,10 @@ public abstract class FileQueryScanNode extends FileScanNode {
         }
         // Update required slots and column_idxs in scanRangeLocations.
         setColumnPositionMapping();
+    }
+
+    public void setTableSample(TableSample tSample) {
+        this.tableSample = tSample;
     }
 
     @Override
@@ -255,7 +268,7 @@ public abstract class FileQueryScanNode extends FileScanNode {
             ConnectContext.get().getExecutor().getSummaryProfile().setGetSplitsFinishTime();
         }
         this.inputSplitsNum = inputSplits.size();
-        if (inputSplits.isEmpty()) {
+        if (inputSplits.isEmpty() && !(getLocationType() == TFileType.FILE_STREAM)) {
             return;
         }
         TFileFormatType fileFormatType = getFileFormatType();
@@ -263,6 +276,27 @@ public abstract class FileQueryScanNode extends FileScanNode {
         boolean isCsvOrJson = Util.isCsvFormat(fileFormatType) || fileFormatType == TFileFormatType.FORMAT_JSON;
         if (isCsvOrJson) {
             params.setFileAttributes(getFileAttributes());
+            if (getLocationType() == TFileType.FILE_STREAM) {
+                params.setFileType(TFileType.FILE_STREAM);
+                params.setCompressType(TFileCompressType.PLAIN);
+
+                TScanRangeLocations curLocations = newLocations();
+                TFileRangeDesc rangeDesc = new TFileRangeDesc();
+                rangeDesc.setLoadId(ConnectContext.get().queryId());
+                rangeDesc.setSize(-1);
+                rangeDesc.setFileSize(-1);
+                curLocations.getScanRange().getExtScanRange().getFileScanRange().addToRanges(rangeDesc);
+                curLocations.getScanRange().getExtScanRange().getFileScanRange().setParams(params);
+
+                TScanRangeLocation location = new TScanRangeLocation();
+                long backendId = ConnectContext.get().getBackendId();
+                Backend backend = Env.getCurrentSystemInfo().getIdToBackend().get(backendId);
+                location.setBackendId(backendId);
+                location.setServer(new TNetworkAddress(backend.getHost(), backend.getBePort()));
+                curLocations.addToLocations(location);
+                scanRangeLocations.add(curLocations);
+                return;
+            }
         }
 
         Map<String, String> locationProperties = getLocationProperties();
@@ -271,6 +305,8 @@ public abstract class FileQueryScanNode extends FileScanNode {
             params.setProperties(locationProperties);
         }
 
+        boolean enableSqlCache = ConnectContext.get().getSessionVariable().enableFileCache;
+        boolean enableShortCircuitRead = HdfsResource.enableShortCircuitRead(locationProperties);
         List<String> pathPartitionKeys = getPathPartitionKeys();
         for (Split split : inputSplits) {
             FileSplit fileSplit = (FileSplit) split;
@@ -312,6 +348,7 @@ public abstract class FileQueryScanNode extends FileScanNode {
                 tableFormatFileDesc.setTransactionalHiveParams(transactionalHiveDesc);
                 rangeDesc.setTableFormatParams(tableFormatFileDesc);
             }
+
             // external data lake table
             if (fileSplit instanceof IcebergSplit) {
                 // TODO: extract all data lake split to factory
@@ -324,9 +361,16 @@ public abstract class FileQueryScanNode extends FileScanNode {
 
             curLocations.getScanRange().getExtScanRange().getFileScanRange().addToRanges(rangeDesc);
             TScanRangeLocation location = new TScanRangeLocation();
-            // Use consistent hash to assign the same scan range into the same backend among different queries
-            Backend selectedBackend = ConnectContext.get().getSessionVariable().enableFileCache
-                    ? backendPolicy.getNextConsistentBe(curLocations) : backendPolicy.getNextBe();
+            Backend selectedBackend;
+            if (enableSqlCache) {
+                // Use consistent hash to assign the same scan range into the same backend among different queries
+                selectedBackend = backendPolicy.getNextConsistentBe(curLocations);
+            } else if (enableShortCircuitRead) {
+                // Try to find a local BE if enable hdfs short circuit read
+                selectedBackend = backendPolicy.getNextLocalBe(Arrays.asList(fileSplit.getHosts()));
+            } else {
+                selectedBackend = backendPolicy.getNextBe();
+            }
             location.setBackendId(selectedBackend.getId());
             location.setServer(new TNetworkAddress(selectedBackend.getHost(), selectedBackend.getBePort()));
             curLocations.addToLocations(location);
@@ -347,20 +391,24 @@ public abstract class FileQueryScanNode extends FileScanNode {
             Map<String, String> locationProperties) throws UserException {
         if (locationType == TFileType.FILE_HDFS || locationType == TFileType.FILE_BROKER) {
             if (!params.isSetHdfsParams()) {
-                String fsName = getFsName(fileSplit);
                 THdfsParams tHdfsParams = HdfsResource.generateHdfsParam(locationProperties);
-                tHdfsParams.setFsName(fsName);
+                // tHdfsParams.setFsName(getFsName(fileSplit));
                 params.setHdfsParams(tHdfsParams);
             }
 
-            if (locationType == TFileType.FILE_BROKER && !params.isSetBrokerAddresses()) {
-                FsBroker broker = Env.getCurrentEnv().getBrokerMgr().getAnyAliveBroker();
-                if (broker == null) {
-                    throw new UserException("No alive broker.");
+            if (locationType == TFileType.FILE_BROKER) {
+                params.setProperties(locationProperties);
+
+                if (!params.isSetBrokerAddresses()) {
+                    FsBroker broker = Env.getCurrentEnv().getBrokerMgr().getAnyAliveBroker();
+                    if (broker == null) {
+                        throw new UserException("No alive broker.");
+                    }
+                    params.addToBrokerAddresses(new TNetworkAddress(broker.host, broker.port));
                 }
-                params.addToBrokerAddresses(new TNetworkAddress(broker.host, broker.port));
             }
-        } else if (locationType == TFileType.FILE_S3 && !params.isSetProperties()) {
+        } else if ((locationType == TFileType.FILE_S3 || locationType == TFileType.FILE_LOCAL)
+                && !params.isSetProperties()) {
             params.setProperties(locationProperties);
         }
 
@@ -397,13 +445,10 @@ public abstract class FileQueryScanNode extends FileScanNode {
         rangeDesc.setColumnsFromPathKeys(columnsFromPathKeys);
 
         rangeDesc.setFileType(locationType);
+        rangeDesc.setPath(fileSplit.getPath().toString());
         if (locationType == TFileType.FILE_HDFS) {
-            rangeDesc.setPath(fileSplit.getPath().toUri().getPath());
-        } else if (locationType == TFileType.FILE_S3
-                || locationType == TFileType.FILE_BROKER
-                || locationType == TFileType.FILE_NET) {
-            // need full path
-            rangeDesc.setPath(fileSplit.getPath().toString());
+            URI fileUri = fileSplit.getPath().toUri();
+            rangeDesc.setFsName(fileUri.getScheme() + "://" + fileUri.getAuthority());
         }
         rangeDesc.setModificationTime(fileSplit.getModificationTime());
         return rangeDesc;
@@ -445,6 +490,10 @@ public abstract class FileQueryScanNode extends FileScanNode {
                 }
                 return Optional.of(TFileType.FILE_S3);
             } else if (location.startsWith(FeConstants.FS_PREFIX_HDFS)) {
+                return Optional.of(TFileType.FILE_HDFS);
+            } else if (location.startsWith(FeConstants.FS_PREFIX_VIEWFS)) {
+                return Optional.of(TFileType.FILE_HDFS);
+            } else if (location.startsWith(FeConstants.FS_PREFIX_COSN)) {
                 return Optional.of(TFileType.FILE_HDFS);
             } else if (location.startsWith(FeConstants.FS_PREFIX_FILE)) {
                 return Optional.of(TFileType.FILE_LOCAL);
